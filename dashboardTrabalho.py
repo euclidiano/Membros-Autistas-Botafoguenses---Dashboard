@@ -8,36 +8,53 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.ticker as ticker
 
+# Configuração Inicial da Janela
 root = tk.Tk()
 root.withdraw()
 root.title("Membros Autistas Botafoguenses - Dashboard")
-root.geometry("1920x1080")
+
+# Tenta iniciar maximizado ou com tamanho seguro
+try:
+    root.state('zoomed')
+except:
+    root.geometry("1280x720")
 
 CSV_FILE = "dados.csv"
+# URL de Exportação (Verifique se a planilha está publicada na web como CSV)
 URL_SHEET = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSdZFeAdOutdhsgJqs34JK0KA9egnlqstBHBx-KH-R2z8EhV_-uJbgHLLzJz5r5E_3eCfiqpi7ZhE79/pub?output=csv"
 
 COLUNAS_PRINCIPAIS = [
-    "ID","Nome","Nascimento","Telefone","CPF","Email","Profissão",
-    "Carteirinha","Ajuda","PCD","TEA","CEP",
+    "ID", "Nome", "Nascimento", "Telefone", "CPF", "Email", "Profissão",
+    "Carteirinha", "Ajuda", "PCD", "TEA", "CEP", "DataEntrada"
 ]
 
 sync_queue = Queue()
-INTERVALO_SYNC_MS = 300000
+INTERVALO_SYNC_MS = 300000  # 5 minutos
+
+# Variáveis globais para janelas de gráficos
+janela_graf_cart = None
+janela_graf_tea = None
+janela_graf_crescimento = None
+janela_graf_ajuda_linha = None
 
 def sincronizar_dados(mostrar_popup=True):
     df_local = pd.DataFrame(columns=COLUNAS_PRINCIPAIS)
+    
+    # 1. Carregar Local
     if os.path.exists(CSV_FILE):
         try:
             df_local = pd.read_csv(CSV_FILE)
             if "Email" in df_local.columns:
                 df_local["Email"] = df_local["Email"].astype(str).str.lower().str.strip()
-        except pd.errors.EmptyDataError:
-            pass
         except Exception as e:
             print(f"Erro ao ler CSV local: {e}")
+
+    # 2. Carregar Remoto
     try:
         df_remoto = pd.read_csv(URL_SHEET)
+        # Limpeza de nomes de colunas (remove espaços extras)
         df_remoto.columns = df_remoto.columns.str.replace(r'\s+', ' ', regex=True).str.strip()
+        
         mapa_colunas = {
             "Nome completo": "Nome",
             "Endereço de e-mail": "Email",
@@ -52,38 +69,57 @@ def sincronizar_dados(mostrar_popup=True):
             "Endereço: CEP": "CEP"
         }
         df_remoto.rename(columns=mapa_colunas, inplace=True)
+        
+        # Padronização
         if "DataEntrada" in df_remoto.columns:
             df_remoto["DataEntrada"] = pd.to_datetime(df_remoto["DataEntrada"], errors="coerce")
-        colunas_para_manter = [col for col in COLUNAS_PRINCIPAIS if col in df_remoto.columns]
-        df_remoto = df_remoto[colunas_para_manter]
+        
         if "Email" in df_remoto.columns:
             df_remoto["Email"] = df_remoto["Email"].astype(str).str.lower().str.strip()
+
+        if "Carteirinha" in df_remoto.columns:
+            df_remoto["Carteirinha"] = df_remoto["Carteirinha"].astype(str).str[:3]
+
     except Exception as e:
         print(f"AVISO: Não foi possível carregar dados da planilha. Erro: {e}")
         if mostrar_popup:
-            messagebox.showwarning("Sem Conexão", "Não foi possível sincronizar. Usando dados locais.")
+            messagebox.showwarning("Modo Offline", "Sem conexão com a planilha Google. Usando dados locais.")
         return df_local
-    df_combinado = pd.concat([df_local, df_remoto], ignore_index=True)
+
+    # 3. Combinar e Remover Duplicatas (CORREÇÃO CRÍTICA)
+    # Prioriza dados do df_remoto se houver conflito
+    df_combinado = pd.concat([df_remoto, df_local], ignore_index=True)
+    
+    # Remove duplicatas baseado no Email (ou Nome se Email não for confiável)
+    if "Email" in df_combinado.columns:
+        df_combinado = df_combinado.drop_duplicates(subset=["Email"], keep="first")
+    
+    # Filtra apenas colunas desejadas que existam no dataframe
+    cols_existentes = [col for col in COLUNAS_PRINCIPAIS if col in df_combinado.columns]
+    df_combinado = df_combinado[cols_existentes]
+
     try:
         df_combinado.to_csv(CSV_FILE, index=False)
         if mostrar_popup:
-            messagebox.showinfo("Sincronização", f"Dados sincronizados!\nTotal de {len(df_combinado)} registros carregados.")
-    except Exception:
-        if mostrar_popup:
-            messagebox.showerror("Erro de Arquivo", "Não foi possível salvar o dados.csv.")
+            messagebox.showinfo("Sincronização", f"Dados atualizados!\nTotal: {len(df_combinado)} registros.")
+    except Exception as e:
+        print(f"Erro ao salvar CSV: {e}")
+
+    # Regenera IDs sequenciais para visualização
     df_combinado = df_combinado.reset_index(drop=True)
     df_combinado["ID"] = df_combinado.index + 1
-    return df_combinado.reset_index(drop=True)
+    
+    return df_combinado
 
 def sincronizar_em_background():
-    print("Iniciando sincronização em background...")
+    print("Iniciando sync background...")
     try:
         df_novo = sincronizar_dados(mostrar_popup=False)
-        if df_novo is not None:
+        if df_novo is not None and not df_novo.empty:
             sync_queue.put(df_novo)
-            print("Sincronização em background concluída.")
+            print("Sync background concluído.")
     except Exception as e:
-        print(f"Erro durante a sincronização em background: {e}")
+        print(f"Erro no background: {e}")
 
 def agendar_sincronizacao_periodica():
     threading.Thread(target=sincronizar_em_background, daemon=True).start()
@@ -93,25 +129,25 @@ def verificar_fila_e_atualizar_ui():
     global df
     try:
         df_novo = sync_queue.get(block=False)
-        if not df.equals(df_novo):
-            print("Novos dados detectados! Atualizando a tabela.")
+        # Verifica se mudou o tamanho ou algo relevante para não redesenhar à toa
+        if len(df_novo) != len(df) or not df_novo.equals(df):
+            print("Atualizando UI com novos dados...")
             df = df_novo
             atualizar_tabela(df)
-            coluna_menu['values'] = df.columns.tolist() if not df.empty else COLUNAS_PRINCIPAIS
-        else:
-            print("Sincronização verificada, sem mudanças.")
     except Exception:
         pass
-    root.after(200, verificar_fila_e_atualizar_ui)
+    root.after(1000, verificar_fila_e_atualizar_ui) # Verifica a cada 1s
 
+# --- Inicialização dos Dados ---
 df = sincronizar_dados(mostrar_popup=True)
 
+# --- Lógica de CRUD Local ---
 def salvar_registro():
     global df
     novo = {
         "Nome": entry_nome.get(),
         "Nascimento": entry_nascimento.get(),
-        "Email": entry_email.get(),
+        "Email": entry_email.get().lower().strip(),
         "Telefone": entry_telefone.get(),
         "CPF": entry_cpf.get(),
         "Profissão": entry_profissao.get(),
@@ -119,62 +155,45 @@ def salvar_registro():
         "Ajuda": entry_ajuda.get(),
         "PCD": entry_pcd.get(),
         "TEA": entry_tea.get(),
-        "CEP":entry_cep.get()
+        "CEP": entry_cep.get(),
+        "DataEntrada": pd.Timestamp.now()
     }
-    novo["Email"] = novo["Email"].lower().strip()
-    if not novo["Email"] or novo["Email"] not in df["Email"].values:
-        df = pd.concat([df, pd.DataFrame([novo])], ignore_index=True)
+    
+    if not novo["Email"]:
+        messagebox.showwarning("Erro", "O Email é obrigatório.")
+        return
+
+    if not df.empty and novo["Email"] in df["Email"].values:
+        messagebox.showwarning("Erro", "Este email já está cadastrado.")
+    else:
+        novo_df = pd.DataFrame([novo])
+        df = pd.concat([df, novo_df], ignore_index=True)
+        df["ID"] = df.index + 1
         df.to_csv(CSV_FILE, index=False)
         messagebox.showinfo("Sucesso", "Registro adicionado!")
         atualizar_tabela(df)
-    else:
-        messagebox.showwarning("Erro", "Um registro com este email já existe.")
-
-frame_cadastro = tk.LabelFrame(root, text="Cadastro")
-frame_cadastro.pack(fill="x", padx=9, pady=5)
-
-entry_nome = ttk.Entry(frame_cadastro)
-entry_nascimento = ttk.Entry(frame_cadastro)
-entry_email = ttk.Entry(frame_cadastro)
-entry_telefone = ttk.Entry(frame_cadastro)
-entry_cpf = ttk.Entry(frame_cadastro)
-entry_profissao = ttk.Entry(frame_cadastro)
-entry_carteirinha = ttk.Entry(frame_cadastro)
-entry_ajuda = ttk.Entry(frame_cadastro)
-entry_pcd = ttk.Entry(frame_cadastro)
-entry_tea = ttk.Entry(frame_cadastro)
-entry_cep = ttk.Entry(frame_cadastro)
-
-labels = ["Nome", "Nascimento", "Email", "Telefone", "CPF","Profissão","Carteirinha","Ajuda","PCD","TEA","CEP"]
-entries = [entry_nome, entry_nascimento, entry_email, entry_telefone, entry_cpf,entry_profissao,entry_carteirinha,entry_ajuda,entry_pcd,entry_tea,entry_cep]
-
-for i, (label, entry) in enumerate(zip(labels, entries)):
-    ttk.Label(frame_cadastro, text=label).grid(row=0, column=i, padx=5, pady=5)
-    entry.grid(row=1, column=i, padx=5, pady=5)
-
-ttk.Button(frame_cadastro, text="Adicionar", command=salvar_registro).grid(row=1, column=len(entries), padx=5)
-
-def pesquisar():
-    coluna = coluna_var.get()
-    valor = entrada_valor.get()
-    if coluna and valor:
-        resultado = df[df[coluna].astype(str).str.contains(valor, case=False, na=False)]
-        atualizar_tabela(resultado)
-    else:
-        atualizar_tabela(df)
+        # Limpar campos (opcional)
+        for entry in entries: entry.delete(0, tk.END)
 
 def atualizar_tabela(dados):
-    dados_display = dados.copy()
-    cols_para_exibir = [c for c in COLUNAS_PRINCIPAIS if c in dados_display.columns]
-    for c in COLUNAS_PRINCIPAIS:
-        if c not in dados_display.columns:
-            dados_display[c] = ""
-    if "DataEntrada" in dados_display.columns:
-        dados_display["DataEntrada"] = dados_display["DataEntrada"].fillna("").astype(str)
     for i in tabela.get_children():
         tabela.delete(i)
+    
+    if dados is None or dados.empty:
+        return
+
+    dados_display = dados.copy()
+    # Garante que colunas existam para exibição
+    for col in COLUNAS_PRINCIPAIS:
+        if col not in dados_display.columns:
+            dados_display[col] = ""
+            
+    # Formata data para string
+    if "DataEntrada" in dados_display.columns:
+        dados_display["DataEntrada"] = pd.to_datetime(dados_display["DataEntrada"], errors='coerce').dt.strftime('%Y-%m-%d')
+
     for idx, row in dados_display.iterrows():
-        values = [row[col] for col in COLUNAS_PRINCIPAIS if col in dados_display.columns]
+        values = [row.get(col, "") for col in COLUNAS_PRINCIPAIS]
         tabela.insert("", "end", iid=idx, values=values)
 
 def excluir():
@@ -183,185 +202,231 @@ def excluir():
         messagebox.showwarning("Atenção", "Selecione um registro para excluir")
         return
     global df
-    try:
-        indices_para_excluir = [int(item) for item in selected_items]
-        df = df.drop(indices_para_excluir).reset_index(drop=True)
-        df.to_csv(CSV_FILE, index=False)
+    if messagebox.askyesno("Confirmar", "Deseja realmente excluir o(s) registro(s)?"):
+        try:
+            indices_tabela = [int(item) for item in selected_items]
+            # Precisamos mapear o indice da tabela para o indice do DF real se houver filtro/ordenação
+            # Para simplificar aqui, vamos assumir que o ID é a chave segura ou o index se não houver filtro ativo
+            # Melhor abordagem: pegar o Email da linha selecionada e remover do DF
+            
+            emails_para_remover = []
+            for i in selected_items:
+                vals = tabela.item(i)['values']
+                # Assumindo que Email é a coluna indice 5 em COLUNAS_PRINCIPAIS
+                emails_para_remover.append(str(vals[5])) 
+
+            df = df[~df["Email"].isin(emails_para_remover)]
+            df.to_csv(CSV_FILE, index=False)
+            atualizar_tabela(df)
+            messagebox.showinfo("Sucesso", "Registro(s) excluído(s).")
+        except Exception as e:
+            print(f"Erro ao excluir: {e}")
+            messagebox.showerror("Erro", "Erro ao excluir.")
+
+def pesquisar():
+    coluna = coluna_var.get()
+    valor = entrada_valor.get()
+    if coluna and valor and not df.empty:
+        try:
+            resultado = df[df[coluna].astype(str).str.contains(valor, case=False, na=False)]
+            atualizar_tabela(resultado)
+        except Exception as e:
+            print(f"Erro na busca: {e}")
+    else:
         atualizar_tabela(df)
-        messagebox.showinfo("Sucesso", "Registro(s) excluído(s).")
-    except Exception as e:
-        print(f"Erro ao excluir: {e}")
-        messagebox.showerror("Erro", "Não foi possível excluir o registro.")
 
-janela_graf_cart = None
-janela_graf_tea = None
-janela_graf_crescimento = None
-janela_graf_ajuda = None
+# --- Interface Gráfica (Layout Melhorado) ---
+frame_cadastro = tk.LabelFrame(root, text="Cadastro de Membro")
+frame_cadastro.pack(fill="x", padx=10, pady=5)
 
+labels = ["Nome", "Nascimento", "Email", "Telefone", "CPF","Profissão","Carteirinha","Ajuda","PCD","TEA","CEP"]
+# Criando dicionário para acesso fácil se precisar
+entries_widgets = {}
+entries = []
+
+# Grid inteligente (quebra linha a cada 4 itens)
+cols_per_row = 6
+for i, label_text in enumerate(labels):
+    r = (i // cols_per_row) * 2
+    c = i % cols_per_row
+    
+    ttk.Label(frame_cadastro, text=label_text).grid(row=r, column=c, padx=5, pady=(5,0), sticky="w")
+    entry = ttk.Entry(frame_cadastro)
+    entry.grid(row=r+1, column=c, padx=5, pady=(0,5), sticky="ew")
+    entries.append(entry)
+    
+    # Referencias globais para salvar_registro usar
+    if label_text == "Nome": entry_nome = entry
+    elif label_text == "Nascimento": entry_nascimento = entry
+    elif label_text == "Email": entry_email = entry
+    elif label_text == "Telefone": entry_telefone = entry
+    elif label_text == "CPF": entry_cpf = entry
+    elif label_text == "Profissão": entry_profissao = entry
+    elif label_text == "Carteirinha": entry_carteirinha = entry
+    elif label_text == "Ajuda": entry_ajuda = entry
+    elif label_text == "PCD": entry_pcd = entry
+    elif label_text == "TEA": entry_tea = entry
+    elif label_text == "CEP": entry_cep = entry
+
+ttk.Button(frame_cadastro, text="Salvar no Banco Local", command=salvar_registro).grid(row=4, column=0, columnspan=2, pady=10, sticky="w", padx=5)
+
+# --- Área de Controles e Gráficos ---
+frame_controles = tk.Frame(root)
+frame_controles.pack(fill="x", padx=10)
+
+frame_pesquisa = tk.LabelFrame(frame_controles, text="Pesquisa")
+frame_pesquisa.pack(side="left", fill="y", padx=(0, 10))
+
+coluna_var = tk.StringVar()
+coluna_menu = ttk.Combobox(frame_pesquisa, textvariable=coluna_var, values=COLUNAS_PRINCIPAIS, state="readonly", width=15)
+if COLUNAS_PRINCIPAIS: coluna_menu.current(1) # Seleciona Nome por padrão
+coluna_menu.pack(side="left", padx=5, pady=5)
+
+entrada_valor = ttk.Entry(frame_pesquisa, width=20)
+entrada_valor.pack(side="left", padx=5, pady=5)
+ttk.Button(frame_pesquisa, text="Buscar", command=pesquisar).pack(side="left", padx=5)
+ttk.Button(frame_pesquisa, text="Limpar", command=lambda: atualizar_tabela(df)).pack(side="left", padx=5)
+
+frame_graficos = tk.LabelFrame(frame_controles, text="Dashboard Analytics")
+frame_graficos.pack(side="left", fill="both", expand=True)
+
+# --- Funções dos Gráficos (Mantidas e Corrigidas) ---
 def abrir_grafico_carteirinha():
     global janela_graf_cart
-    if "Carteirinha" not in df.columns or df["Carteirinha"].isnull().all():
-        messagebox.showwarning("Sem Dados", "Não há dados suficientes de 'Carteirinha' para gerar o gráfico.")
+    if "Carteirinha" not in df.columns or df.empty: return
+    
+    if janela_graf_cart and janela_graf_cart.winfo_exists():
+        janela_graf_cart.lift()
         return
-    if janela_graf_cart is not None:
-        try:
-            janela_graf_cart.destroy()
-        except tk.TclError:
-            pass
-    contagem = df["Carteirinha"].value_counts().sort_index()
+
     janela_graf_cart = tk.Toplevel(root)
-    janela_graf_cart.title("Gráfico de Carteirinha")
-    fig = Figure(figsize=(7, 5), dpi=100)
+    janela_graf_cart.title("Solicitações de Carteirinha")
+    janela_graf_cart.geometry("600x400")
+    
+    # Normalizar dados (Sim/Não/Talvez)
+    dados = df["Carteirinha"].str.lower().str.strip()
+    contagem = dados.value_counts()
+    
+    fig = Figure(figsize=(6, 4), dpi=100)
     ax = fig.add_subplot(111)
-    barras = ax.bar(contagem.index, contagem.values, color='skyblue')
-    ax.set_title("Pessoas que desejam receber a carteirinha")
-    ax.set_xlabel("Pessoas")
-    ax.set_ylabel("Quantidade")
-    ax.bar_label(barras, fmt='%d')
-    canvas = FigureCanvasTkAgg(fig, master=janela_graf_cart)
-    canvas.draw()
-    canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
+    barras = ax.bar(contagem.index, contagem.values, color='#4CAF50')
+    ax.set_title("Interesse na Carteirinha")
+    ax.bar_label(barras)
+    
+    FigureCanvasTkAgg(fig, master=janela_graf_cart).get_tk_widget().pack(fill="both", expand=True)
 
 def abrir_grafico_tea():
     global janela_graf_tea
-    if "TEA" not in df.columns or df["TEA"].isnull().all():
-        messagebox.showwarning("Sem Dados", "Não há dados suficientes de 'TEA' para gerar o gráfico.")
+    if "TEA" not in df.columns or df.empty: return
+
+    if janela_graf_tea and janela_graf_tea.winfo_exists():
+        janela_graf_tea.lift()
         return
-    if janela_graf_tea is not None:
-        try:
-            janela_graf_tea.destroy()
-        except tk.TclError:
-            pass
-    contagem = df["TEA"].value_counts()
+
     janela_graf_tea = tk.Toplevel(root)
-    janela_graf_tea.title("Gráfico de Pessoas que Trabalham com Público TEA")
-    fig = Figure(figsize=(5, 4), dpi=100)
+    janela_graf_tea.title("Profissionais TEA")
+    
+    contagem = df["TEA"].value_counts()
+    fig = Figure(figsize=(5, 5), dpi=100)
     ax = fig.add_subplot(111)
     ax.pie(contagem, labels=contagem.index, autopct='%1.1f%%', startangle=90)
-    ax.axis('equal')
-    ax.set_title("Trabalha com Público TEA")
-    canvas = FigureCanvasTkAgg(fig, master=janela_graf_tea)
-    canvas.draw()
-    canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
-
-def abrir_grafico_ajuda():
-    global janela_graf_ajuda
-    if "Ajuda" not in df.columns or df["Ajuda"].isnull().all():
-        messagebox.showwarning("Sem Dados", "Não há dados suficientes de 'Ajuda' para gerar o gráfico.")
-        return
-    if janela_graf_ajuda is not None:
-        try:
-            janela_graf_ajuda.destroy()
-        except tk.TclError:
-            pass
-    contagem = df["Ajuda"].value_counts()
-    janela_graf_ajuda = tk.Toplevel(root)
-    janela_graf_ajuda.title("Gráfico de Pessoas que Desejam Ajudar")
-    fig = Figure(figsize=(5, 4), dpi=100)
-    ax = fig.add_subplot(111)
-    ax.pie(contagem, labels=contagem.index, autopct='%1.1f%%', startangle=90, colors=['#66b3ff', '#ff9999'])
-    ax.axis('equal')
-    ax.set_title("Deseja Ajudar")
-    canvas = FigureCanvasTkAgg(fig, master=janela_graf_ajuda)
-    canvas.draw()
-    canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
+    ax.set_title("Trabalha com público TEA?")
+    
+    FigureCanvasTkAgg(fig, master=janela_graf_tea).get_tk_widget().pack(fill="both", expand=True)
 
 def abrir_grafico_crescimento():
     global janela_graf_crescimento
-    if janela_graf_crescimento is not None:
-        try:
-            janela_graf_crescimento.destroy()
-        except tk.TclError:
-            pass
-    if "DataEntrada" not in df.columns:
-        if "Carimbo de data/hora" in df.columns:
-            df.rename(columns={"Carimbo de data/hora": "DataEntrada"}, inplace=True)
-        else:
-            df["DataEntrada"] = pd.Timestamp.now()
-    df["DataEntrada"] = pd.to_datetime(df["DataEntrada"], errors="coerce")
-    if df["DataEntrada"].isnull().all():
-        df["DataEntrada"] = pd.Timestamp.now()
-    df["Ano"] = df["DataEntrada"].dt.year
-    crescimento = df.groupby("Ano").size().reset_index(name="Quantidade")
-    ano_inicial = 2024
-    ano_final = max(2025, crescimento["Ano"].max())
-    anos_completos = pd.DataFrame({"Ano": range(ano_inicial, ano_final + 1)})
-    crescimento = pd.merge(anos_completos, crescimento, on="Ano", how="left").fillna(0)
-    crescimento["Quantidade"] = crescimento["Quantidade"].astype(int)
-    crescimento["Crescimento Acumulado"] = crescimento["Quantidade"].cumsum()
+    if janela_graf_crescimento and janela_graf_crescimento.winfo_exists():
+        janela_graf_crescimento.lift()
+        return
+
+    # Preparação de dados segura
+    temp_df = df.copy()
+    if "DataEntrada" not in temp_df.columns: return
+    
+    temp_df["DataEntrada"] = pd.to_datetime(temp_df["DataEntrada"], errors="coerce")
+    temp_df = temp_df.dropna(subset=["DataEntrada"])
+    if temp_df.empty: 
+        messagebox.showinfo("Info", "Sem datas válidas para gerar gráfico de crescimento.")
+        return
+
+    temp_df["Ano"] = temp_df["DataEntrada"].dt.year
+    crescimento = temp_df.groupby("Ano").size().cumsum().reset_index(name="Total")
+    
     janela_graf_crescimento = tk.Toplevel(root)
-    janela_graf_crescimento.title("Gráfico de Crescimento")
+    janela_graf_crescimento.title("Crescimento Acumulado")
+    
     fig = Figure(figsize=(6, 4), dpi=100)
     ax = fig.add_subplot(111)
-    ax.bar(crescimento["Ano"], crescimento["Quantidade"], color='skyblue', alpha=0.5, label="Novos Cadastros")
-    ax.plot(crescimento["Ano"], crescimento["Crescimento Acumulado"], marker='o', color='blue', label="Crescimento Acumulado")
-    ax.set_title("Crescimento de Membros (2024 em diante)")
-    ax.set_xlabel("Ano")
-    ax.set_ylabel("Quantidade de Cadastros")
+    ax.plot(crescimento["Ano"], crescimento["Total"], marker='o', linestyle='-', color='blue')
+    ax.set_title("Evolução do Número de Membros")
+    ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    ax.grid(True, linestyle='--')
+    
+    FigureCanvasTkAgg(fig, master=janela_graf_crescimento).get_tk_widget().pack(fill="both", expand=True)
+
+def abrir_grafico_ajuda_linha():
+    global janela_graf_ajuda_linha
+    if "Ajuda" not in df.columns or "DataEntrada" not in df.columns: return
+    
+    if janela_graf_ajuda_linha and janela_graf_ajuda_linha.winfo_exists():
+        janela_graf_ajuda_linha.lift()
+        return
+
+    # Processamento de dados
+    temp_df = df.copy()
+    temp_df["DataEntrada"] = pd.to_datetime(temp_df["DataEntrada"], errors="coerce")
+    temp_df = temp_df.dropna(subset=["DataEntrada"])
+    temp_df["Ano"] = temp_df["DataEntrada"].dt.year
+    
+    # Filtra Sim/Não
+    temp_df["Ajuda_Sim"] = temp_df["Ajuda"].astype(str).str.lower().str.contains("sim")
+    
+    agrupado = temp_df.groupby("Ano")["Ajuda_Sim"].sum().reset_index(name="Doadores")
+    
+    janela_graf_ajuda_linha = tk.Toplevel(root)
+    janela_graf_ajuda_linha.title("Evolução de Doadores")
+    
+    fig = Figure(figsize=(6, 4), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.plot(agrupado["Ano"], agrupado["Doadores"], marker='s', color='green', label="Membros Contribuintes")
+    ax.set_title("Novos Doadores por Ano")
     ax.legend()
-    ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
-    ax.set_ylim(bottom=0)
-    canvas = FigureCanvasTkAgg(fig, master=janela_graf_crescimento)
-    canvas.draw()
-    canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
+    ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    
+    FigureCanvasTkAgg(fig, master=janela_graf_ajuda_linha).get_tk_widget().pack(fill="both", expand=True)
 
-frame_pesquisa = tk.LabelFrame(root, text="Pesquisa")
-frame_pesquisa.pack(fill="x", padx=10, pady=5)
+# Botões de Gráfico
+ttk.Button(frame_graficos, text="Carteirinha (Barras)", command=abrir_grafico_carteirinha).pack(side="left", padx=5, pady=5)
+ttk.Button(frame_graficos, text="TEA (Pizza)", command=abrir_grafico_tea).pack(side="left", padx=5, pady=5)
+ttk.Button(frame_graficos, text="Crescimento (Linha)", command=abrir_grafico_crescimento).pack(side="left", padx=5, pady=5)
+ttk.Button(frame_graficos, text="Doações (Anual)", command=abrir_grafico_ajuda_linha).pack(side="left", padx=5, pady=5)
 
-frame_graficos = tk.LabelFrame(root, text="Gráficos")
-frame_graficos.pack(fill="x", padx=10, pady=5)
-ttk.Button(frame_graficos, text="Gráfico da Carteirinha", command=abrir_grafico_carteirinha).pack(side="left", padx=5)
-ttk.Button(frame_graficos, text="Gráfico TEA", command=abrir_grafico_tea).pack(side="left", padx=5)
-ttk.Button(frame_graficos, text="Gráfico Crescimento", command=abrir_grafico_crescimento).pack(side="left", padx=5)
-ttk.Button(frame_graficos, text="Gráfico Ajuda", command=abrir_grafico_ajuda).pack(side="left", padx=5)
+# --- Tabela ---
+frame_tabela = tk.Frame(root)
+frame_tabela.pack(fill="both", expand=True, padx=10, pady=5)
 
-coluna_var = tk.StringVar()
-coluna_menu = ttk.Combobox(frame_pesquisa, textvariable=coluna_var)
-coluna_menu['values'] = df.columns.tolist() if not df.empty else COLUNAS_PRINCIPAIS
-coluna_menu.grid(row=0, column=0, padx=5, pady=5)
-entrada_valor = ttk.Entry(frame_pesquisa)
-entrada_valor.grid(row=0, column=1, padx=5, pady=5)
-ttk.Button(frame_pesquisa, text="Pesquisar", command=pesquisar).grid(row=0, column=2, padx=5)
+tabela_scroll = ttk.Scrollbar(frame_tabela)
+tabela_scroll.pack(side="right", fill="y")
 
-colunas_para_mostrar = df.columns.tolist()
-tabela = ttk.Treeview(root, columns=colunas_para_mostrar, show="headings")
-for col in colunas_para_mostrar:
+tabela = ttk.Treeview(frame_tabela, columns=COLUNAS_PRINCIPAIS, show="headings", yscrollcommand=tabela_scroll.set)
+tabela_scroll.config(command=tabela.yview)
+
+for col in COLUNAS_PRINCIPAIS:
     tabela.heading(col, text=col)
-    tabela.column(col, width=120, minwidth=80)
+    tabela.column(col, width=100, minwidth=50)
 
-tabela.pack(expand=True, fill='both', padx=10, pady=5)
-ttk.Button(root, text="Excluir Selecionado", command=excluir).pack(pady=5)
+tabela.pack(fill="both", expand=True)
+ttk.Button(root, text="Excluir Registro Selecionado", command=excluir).pack(pady=5)
 
-atualizar_tabela(df)
-
-def ajustar_colunas():
-    total_colunas = len(COLUNAS_PRINCIPAIS)
-    largura_janela = root.winfo_width() - 40
-    largura_coluna = int(largura_janela / total_colunas)
-    for col in COLUNAS_PRINCIPAIS:
-        tabela.column(col, width=largura_coluna, minwidth=80)
-
-atualizar_tabela(df)
-ajustar_colunas()
-
-def ao_redimensionar(event):
-    ajustar_colunas()
-
-root.bind("<Configure>", ao_redimensionar)
-
+# --- Finalização ---
 def ao_fechar():
-    try:
-        if os.path.exists(CSV_FILE):
-            os.remove(CSV_FILE)
-            print("Arquivo .csv removido com sucesso.")
-    except Exception as e:
-        print(f"Erro ao apagar o CSV: {e}")
-    finally:
-        root.destroy()
+    # NÃO APAGAR O CSV - Isso garante que funcione offline na próxima vez
+    root.destroy()
 
 root.protocol("WM_DELETE_WINDOW", ao_fechar)
 root.deiconify()
 verificar_fila_e_atualizar_ui()
-root.after(INTERVALO_SYNC_MS, agendar_sincronizacao_periodica)
-print(f"Sincronização automática agendada para cada {INTERVALO_SYNC_MS / 1000 / 60} minutos.")
+agendar_sincronizacao_periodica()
+
 root.mainloop()
